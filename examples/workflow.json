@@ -6,32 +6,25 @@
     }
   },
   "2": {
-    "class_type": "FlatSepReformerLoader",
+    "class_type": "FlatSepReformerSeparate",
     "inputs": {
-      "model_dir": "",
-      "backend": "modelscope",
+      "audio": ["1", 0],
+      "backend": "auto",
       "device": "auto"
     }
   },
   "3": {
-    "class_type": "FlatSepReformerSeparate",
+    "class_type": "FlatSepReformerSaveAudio",
     "inputs": {
-      "model": ["2", 0],
-      "audio": ["1", 0]
+      "audio": ["2", 0],
+      "filename": "speaker_1",
+      "output_dir": ""
     }
   },
   "4": {
     "class_type": "FlatSepReformerSaveAudio",
     "inputs": {
-      "audio": ["3", 0],
-      "filename": "speaker_1",
-      "output_dir": ""
-    }
-  },
-  "5": {
-    "class_type": "FlatSepReformerSaveAudio",
-    "inputs": {
-      "audio": ["3", 1],
+      "audio": ["2", 1],
       "filename": "speaker_2",
       "output_dir": ""
     }

@@ -9,11 +9,18 @@ FLASepformer（FLA-SepReformer-B）双说话人语音分离模型的 ComfyUI 自
   - 任务: speech-separation（8 kHz 单声道双说话人语音分离）
   - 训练集: Libri2Mix-100
   - 模型文件需放置在 <ComfyUI>/models/FlatSepReformer/ 下
-    （运行 python install.py 或手动下载）
+    （运行 python install.py 自动下载，或手动从 ModelScope 拷贝）
 
-支持两种推理后端:
-  * modelscope : 基于 ModelScope pipeline（pytorch_model.pt）
-  * onnx       : 基于 ONNX Runtime（onnx_model.onnx，更轻量、无需 modelscope）
+节点设计（v2 合并版）:
+  * FlatSepReformerSeparate : 合并"模型加载 + 语音分离"为单节点，
+    自动探测 <ComfyUI>/models/FlatSepReformer（基于插件位置的相对路径推导），
+    无需手动指定模型路径、无需额外加载节点。
+  * FlatSepReformerLoadAudio / FlatSepReformerSaveAudio : 音频加载/保存。
+
+推理后端:
+  * onnx       : ONNX Runtime（onnx_model.onnx），无需 modelscope，默认优先
+  * modelscope : ModelScope pipeline（pytorch_model.pt），需 master 源码版
+  * auto       : 优先 onnx，缺失时回退 modelscope
 
 AUDIO 类型遵循社区通用约定:
   {"waveform": torch.Tensor [B, C, T], "sample_rate": int}
@@ -46,16 +53,27 @@ _MODEL_CACHE = {}
 
 
 # --------------------------------------------------------------------------- #
-# 路径探测
+# 路径探测（相对插件位置推导，不依赖工作目录）
 # --------------------------------------------------------------------------- #
+def _plugin_parents() -> tuple[str, str]:
+    """返回 (custom_nodes 目录, ComfyUI 根目录)。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(here)          # custom_nodes
+    grandparent = os.path.dirname(parent)   # ComfyUI 根
+    return parent, grandparent
+
+
 def find_model_dir(explicit_dir: str = "") -> str:
-    """定位 <ComfyUI>/models/FlatSepReformer 目录。
+    """定位模型目录。
+
+    默认: <ComfyUI>/models/FlatSepReformer
+    （插件位于 <ComfyUI>/custom_nodes/ComfyUI-FlatSepReformer 时，
+     即相对插件目录 ../../models/FlatSepReformer）
 
     优先级:
-      1. 用户在节点上显式填写的 model_dir
-      2. 环境变量 FLATSEPREFORMER_MODEL_DIR
-      3. 自动探测（插件位于 <ComfyUI>/custom_nodes/ComfyUI-FlatSepReformer 时）
-      4. 常见便携版/工作目录位置
+      1. 环境变量 FLATSEPREFORMER_MODEL_DIR
+      2. 相对插件位置推导 <ComfyUI>/models/FlatSepReformer
+      3. 插件内 models/ 与工作目录 models/
     """
     if explicit_dir and os.path.isdir(explicit_dir):
         return os.path.abspath(explicit_dir)
@@ -66,13 +84,12 @@ def find_model_dir(explicit_dir: str = "") -> str:
     if env_dir:
         candidates.append(env_dir)
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    parent = os.path.dirname(here)          # custom_nodes
-    grandparent = os.path.dirname(parent)   # ComfyUI 根
+    parent, grandparent = _plugin_parents()
     if os.path.basename(parent) == "custom_nodes":
         candidates.append(os.path.join(grandparent, "models", MODEL_DIR_NAME))
     candidates.append(os.path.join(parent, "models", MODEL_DIR_NAME))
-    candidates.append(os.path.join(here, "models", MODEL_DIR_NAME))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "models", MODEL_DIR_NAME))
     candidates.append(os.path.join(os.getcwd(), "models", MODEL_DIR_NAME))
 
     for c in candidates:
@@ -85,17 +102,9 @@ def find_model_dir(explicit_dir: str = "") -> str:
     return ""
 
 
-def _comfyui_root() -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
-    parent = os.path.dirname(here)
-    grandparent = os.path.dirname(parent)
-    if os.path.basename(parent) == "custom_nodes" and os.path.isdir(grandparent):
-        return grandparent
-    return os.getcwd()
-
-
 def _default_output_dir() -> str:
-    root = _comfyui_root()
+    parent, grandparent = _plugin_parents()
+    root = grandparent if os.path.basename(parent) == "custom_nodes" else os.getcwd()
     out = os.path.join(root, "output")
     os.makedirs(out, exist_ok=True)
     return out
@@ -145,9 +154,106 @@ def _to_audio_dict(waveform: np.ndarray, sample_rate: int) -> dict:
     }
 
 
+def _peak_norm(signal: np.ndarray) -> np.ndarray:
+    """按峰值归一化到 0.5，与 modelscope pipeline 后处理保持一致。"""
+    peak = float(np.abs(signal).max()) if signal.size else 0.0
+    if peak > 1e-9:
+        signal = signal / peak * 0.5
+    return signal.astype(np.float32)
+
+
 # --------------------------------------------------------------------------- #
 # 推理后端
 # --------------------------------------------------------------------------- #
+def _resolve_device(device: str) -> str:
+    if device != "auto":
+        return device
+    if torch is not None and torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
+
+
+def _pick_backend(model_dir: str, backend: str) -> str:
+    """backend=auto 时优先 onnx（无需 modelscope），否则回退 modelscope。"""
+    if backend != "auto":
+        return backend
+    if os.path.isfile(os.path.join(model_dir, "onnx_model.onnx")) and \
+            importlib.util.find_spec("onnxruntime") is not None:
+        return "onnx"
+    return "modelscope"
+
+
+def _load_onnx_model(model_dir: str, device: str) -> dict:
+    onnx_path = os.path.join(model_dir, "onnx_model.onnx")
+    if not os.path.isfile(onnx_path):
+        raise RuntimeError(f"未找到 ONNX 模型文件: {onnx_path}")
+    try:
+        import onnxruntime
+    except ImportError:
+        raise RuntimeError(
+            "缺少 onnxruntime 依赖，请执行: pip install onnxruntime "
+            "（或使用 modelscope 后端）")
+    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                 if device != "cpu" else ["CPUExecutionProvider"])
+    session = onnxruntime.InferenceSession(onnx_path, providers=providers)
+    return {"backend": "onnx", "session": session, "dir": model_dir}
+
+
+def _load_modelscope_model(model_dir: str, device: str) -> dict:
+    try:
+        from modelscope.pipelines import pipeline
+        from modelscope.utils.constant import Tasks
+    except ImportError:
+        raise RuntimeError(
+            "缺少 modelscope 依赖，请执行: pip install -r requirements.txt")
+    try:
+        pipe = pipeline(Tasks.speech_separation, model=model_dir, device=device)
+    except KeyError as e:
+        raise RuntimeError(
+            "当前 modelscope 版本无法识别该模型（registry 中缺少 "
+            "speech_flatsepreformer_separation_temporal_8k_base_libri2mix100）。\n"
+            "解决办法（任选其一）:\n"
+            "  1. 推荐: 节点 backend 选择 onnx（使用模型自带的 onnx_model.onnx，"
+            "无需 modelscope）\n"
+            "  2. 升级 modelscope 到 master 源码版:\n"
+            "     pip install -U \"modelscope @ "
+            "git+https://github.com/modelscope/modelscope.git@master\""
+        ) from e
+    return {"backend": "modelscope", "pipeline": pipe, "dir": model_dir}
+
+
+def _load_model(model_dir: str, backend: str, device: str) -> dict:
+    backend = _pick_backend(model_dir, backend)
+    dev = _resolve_device(device)
+    key = (model_dir, backend, dev)
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
+    model = (_load_onnx_model(model_dir, dev) if backend == "onnx"
+             else _load_modelscope_model(model_dir, dev))
+    _MODEL_CACHE[key] = model
+    return model
+
+
+def _infer_onnx(session, waveform: np.ndarray) -> list[np.ndarray]:
+    """ONNX Runtime 推理: 输入 mixture [1, T] float32，输出 [spk0, spk1]。"""
+    inp = waveform[None].astype(np.float32)  # [1, T]
+    out = session.run(None, {"mixture": inp})[0]
+    arr = np.asarray(out)
+    if arr.ndim == 3:
+        arr = arr[0]  # [num_spk, T] 或 [T, num_spk]
+    if arr.ndim != 2:
+        raise RuntimeError(f"ONNX 输出维度异常: {arr.shape}")
+    # 归一化为 [num_spk, T]
+    if arr.shape[0] == NUM_SPEAKERS and arr.shape[1] != NUM_SPEAKERS:
+        pass
+    elif arr.shape[1] == NUM_SPEAKERS:
+        arr = arr.T
+    else:
+        raise RuntimeError(f"ONNX 输出无法解析为 {NUM_SPEAKERS} 路: {arr.shape}")
+    # 与 modelscope 后端一致: 按峰值归一化到 0.5
+    return [_peak_norm(arr[0]), _peak_norm(arr[1])]
+
+
 def _infer_modelscope(pipeline_obj, waveform: np.ndarray) -> list[np.ndarray]:
     """ModelScope pipeline 推理: 输入 8k mono float32，返回 [spk0, spk1]。"""
     if sf is None:
@@ -176,67 +282,30 @@ def _infer_modelscope(pipeline_obj, waveform: np.ndarray) -> list[np.ndarray]:
                 pass
 
 
-def _peak_norm(signal: np.ndarray) -> np.ndarray:
-    """按峰值归一化到 0.5，与 modelscope pipeline 后处理保持一致。"""
-    peak = float(np.abs(signal).max()) if signal.size else 0.0
-    if peak > 1e-9:
-        signal = signal / peak * 0.5
-    return signal.astype(np.float32)
-
-
-def _infer_onnx(session, waveform: np.ndarray) -> list[np.ndarray]:
-    """ONNX Runtime 推理: 输入 mixture [1, T] float32，输出 [spk0, spk1]。
-
-    ONNX 模型输出为模型原始尺度（约 int16 量级），
-    这里按峰值归一化到 0.5，与 modelscope 后端输出保持一致。
-    """
-    inp = waveform[None].astype(np.float32)  # [1, T]
-    out = session.run(None, {"mixture": inp})[0]
-    arr = np.asarray(out)
-    if arr.ndim == 3:
-        arr = arr[0]  # [num_spk, T] 或 [T, num_spk]
-    if arr.ndim != 2:
-        raise RuntimeError(f"ONNX 输出维度异常: {arr.shape}")
-    # 归一化为 [num_spk, T]
-    if arr.shape[0] == NUM_SPEAKERS and arr.shape[1] != NUM_SPEAKERS:
-        pass
-    elif arr.shape[1] == NUM_SPEAKERS:
-        arr = arr.T
-    else:
-        raise RuntimeError(f"ONNX 输出无法解析为 {NUM_SPEAKERS} 路: {arr.shape}")
-    return [_peak_norm(arr[0]), _peak_norm(arr[1])]
-
-
-def _resolve_device(device: str) -> str:
-    if device != "auto":
-        return device
-    if torch is not None and torch.cuda.is_available():
-        return "cuda:0"
-    return "cpu"
-
-
 # --------------------------------------------------------------------------- #
-# 节点 1: 模型加载器
+# 合并节点: 模型加载 + 语音分离（v2）
 # --------------------------------------------------------------------------- #
-class FlatSepReformerLoader:
-    """加载 FLASepformer 语音分离模型。
+class FlatSepReformerSeparate:
+    """双说话人语音分离（自动加载模型）。
 
-    模型目录默认从 <ComfyUI>/models/FlatSepReformer 自动探测，
-    也可显式指定，或设置环境变量 FLATSEPREFORMER_MODEL_DIR。
+    - 模型自动从 <ComfyUI>/models/FlatSepReformer 加载（相对插件路径推导），
+      无需单独加载节点、无需填绝对路径。
+    - backend=auto 时优先使用 ONNX（无需 modelscope），
+      modelscope 仅作为可选项。
+    - 输入音频自动重采样到 8000 Hz。
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_dir": (
-                    "STRING",
-                    {"default": "", "multiline": False,
-                     "placeholder": "留空自动探测 <ComfyUI>/models/FlatSepReformer"},
-                ),
+                "audio": ("AUDIO",),
                 "backend": (
-                    ["modelscope", "onnx"],
-                    {"default": "modelscope", "tooltip": "modelscope: 使用 pytorch_model.pt；onnx: 使用 onnx_model.onnx（无需安装 modelscope）"},
+                    ["auto", "onnx", "modelscope"],
+                    {"default": "auto",
+                     "tooltip": "auto: 优先 onnx（无需 modelscope，推荐）；"
+                                "onnx: 使用 onnx_model.onnx；"
+                                "modelscope: 使用 pytorch_model.pt（需 master 版 modelscope）"},
                 ),
                 "device": (
                     ["auto", "cpu", "cuda"],
@@ -245,87 +314,30 @@ class FlatSepReformerLoader:
             }
         }
 
-    RETURN_TYPES = ("FLATSEPREFORMER_MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "load"
-    CATEGORY = "audio/separation"
-
-    def load(self, model_dir: str, backend: str, device: str):
-        d = find_model_dir(model_dir)
-        if not d:
-            raise RuntimeError(
-                "未找到模型目录。请将模型下载到 <ComfyUI>/models/FlatSepReformer/ "
-                "（运行 python install.py 自动下载），"
-                "或在节点上填写 model_dir / 设置环境变量 FLATSEPREFORMER_MODEL_DIR。"
-            )
-        dev = _resolve_device(device)
-        cache_key = (d, backend, dev)
-        if cache_key in _MODEL_CACHE:
-            return (_MODEL_CACHE[cache_key],)
-
-        if backend == "onnx":
-            onnx_path = os.path.join(d, "onnx_model.onnx")
-            if not os.path.isfile(onnx_path):
-                raise RuntimeError(f"未找到 ONNX 模型文件: {onnx_path}")
-            try:
-                import onnxruntime
-            except ImportError:
-                raise RuntimeError("缺少 onnxruntime 依赖，请执行: pip install onnxruntime")
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if dev != "cpu" \
-                else ["CPUExecutionProvider"]
-            session = onnxruntime.InferenceSession(onnx_path, providers=providers)
-            model = {"backend": "onnx", "session": session, "dir": d}
-        else:
-            try:
-                from modelscope.pipelines import pipeline
-                from modelscope.utils.constant import Tasks
-            except ImportError:
-                raise RuntimeError(
-                    "缺少 modelscope 依赖，请执行: pip install -r requirements.txt"
-                    "（模型卡要求安装 master 源码: pip install -U "
-                    "\"modelscope @ git+https://github.com/modelscope/modelscope.git@master\"）"
-                )
-            pipe = pipeline(Tasks.speech_separation, model=d, device=dev)
-            model = {"backend": "modelscope", "pipeline": pipe, "dir": d}
-
-        _MODEL_CACHE[cache_key] = model
-        return (model,)
-
-
-# --------------------------------------------------------------------------- #
-# 节点 2: 语音分离
-# --------------------------------------------------------------------------- #
-class FlatSepReformerSeparate:
-    """双说话人语音分离: 输入混合 AUDIO，输出两路独立说话人 AUDIO。
-
-    输入音频会自动重采样到 8000 Hz（模型要求）。
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("FLATSEPREFORMER_MODEL",),
-                "audio": ("AUDIO",),
-            }
-        }
-
     RETURN_TYPES = ("AUDIO", "AUDIO")
     RETURN_NAMES = ("speaker_1", "speaker_2")
     FUNCTION = "separate"
     CATEGORY = "audio/separation"
 
-    def separate(self, model: dict, audio: dict):
+    def separate(self, audio: dict, backend: str = "auto", device: str = "auto"):
+        model_dir = find_model_dir()
+        if not model_dir:
+            raise RuntimeError(
+                "未找到模型目录。请将模型放到 <ComfyUI>/models/FlatSepReformer/ "
+                "（运行 python install.py 自动下载），"
+                "或设置环境变量 FLATSEPREFORMER_MODEL_DIR。")
+
+        model = _load_model(model_dir, backend, device)
+
         waveform, sr = _to_mono_float32(audio)
         if len(waveform) == 0:
             raise ValueError("输入音频为空")
         if sr != TARGET_SAMPLE_RATE:
             waveform = _resample(waveform, sr, TARGET_SAMPLE_RATE)
 
-        if model["backend"] == "onnx":
-            spks = _infer_onnx(model["session"], waveform)
-        else:
-            spks = _infer_modelscope(model["pipeline"], waveform)
+        spks = (_infer_onnx(model["session"], waveform)
+                if model["backend"] == "onnx"
+                else _infer_modelscope(model["pipeline"], waveform))
 
         return (
             _to_audio_dict(spks[0], TARGET_SAMPLE_RATE),
@@ -334,7 +346,7 @@ class FlatSepReformerSeparate:
 
 
 # --------------------------------------------------------------------------- #
-# 节点 3: 音频加载（开箱即用，不依赖其他音频插件）
+# 音频加载 / 保存
 # --------------------------------------------------------------------------- #
 class FlatSepReformerLoadAudio:
     """从本地文件加载音频（wav/flac/ogg/mp3 等 soundfile 支持的格式）。"""
@@ -365,9 +377,6 @@ class FlatSepReformerLoadAudio:
         return (_to_audio_dict(mono, int(sr)),)
 
 
-# --------------------------------------------------------------------------- #
-# 节点 4: 音频保存
-# --------------------------------------------------------------------------- #
 class FlatSepReformerSaveAudio:
     """将 AUDIO 保存为 wav 文件，返回保存路径。"""
 
@@ -409,14 +418,12 @@ class FlatSepReformerSaveAudio:
 # 注册
 # --------------------------------------------------------------------------- #
 NODE_CLASS_MAPPINGS = {
-    "FlatSepReformerLoader": FlatSepReformerLoader,
     "FlatSepReformerSeparate": FlatSepReformerSeparate,
     "FlatSepReformerLoadAudio": FlatSepReformerLoadAudio,
     "FlatSepReformerSaveAudio": FlatSepReformerSaveAudio,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FlatSepReformerLoader": "FlatSepReformer Loader",
     "FlatSepReformerSeparate": "FlatSepReformer (Separate 2 Speakers)",
     "FlatSepReformerLoadAudio": "Load Audio (FlatSepReformer)",
     "FlatSepReformerSaveAudio": "Save Audio (FlatSepReformer)",
