@@ -47,6 +47,8 @@ MODEL_ID = "iic/speech_flatsepreformer_separation_temporal_8k_base_libri2mix100"
 MODEL_DIR_NAME = "FlatSepReformer"
 TARGET_SAMPLE_RATE = 8000
 NUM_SPEAKERS = 2
+MODEL_FILES = ["configuration.json", "pytorch_model.pt", "onnx_model.onnx"]
+MODELSCOPE_BASE = f"https://modelscope.cn/models/{MODEL_ID}/resolve/master"
 
 # 模块级模型缓存: {(model_dir, backend, device): model}
 _MODEL_CACHE = {}
@@ -108,6 +110,41 @@ def _default_output_dir() -> str:
     out = os.path.join(root, "output")
     os.makedirs(out, exist_ok=True)
     return out
+
+
+def _default_model_dir() -> str:
+    """模型默认目标文件夹: <ComfyUI>/models/FlatSepReformer（相对插件路径推导）。"""
+    parent, grandparent = _plugin_parents()
+    if os.path.basename(parent) == "custom_nodes":
+        return os.path.join(grandparent, "models", MODEL_DIR_NAME)
+    return os.path.join(os.getcwd(), "models", MODEL_DIR_NAME)
+
+
+def _auto_download_model(model_dir: str) -> None:
+    """运行时自动下载模型（HTTP 直连 ModelScope，无需安装 modelscope 包）。
+
+    下载 <ComfyUI>/models/FlatSepReformer/ 下的三个模型文件
+    （configuration.json / pytorch_model.pt / onnx_model.onnx）。
+    """
+    if os.path.isfile(os.path.join(model_dir, "configuration.json")):
+        return
+    os.makedirs(model_dir, exist_ok=True)
+    import urllib.request
+    for fname in MODEL_FILES:
+        dest = os.path.join(model_dir, fname)
+        if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+            continue
+        print(f"[FlatSepReformer] 正在自动下载模型文件: {fname} ...")
+        try:
+            urllib.request.urlretrieve(f"{MODELSCOPE_BASE}/{fname}", dest)
+        except Exception as e:
+            raise RuntimeError(
+                f"模型自动下载失败（{fname}）: {e}\n"
+                f"请手动下载模型后放入目标文件夹: {os.path.abspath(model_dir)}\n"
+                "下载方式: 夸克网盘 https://pan.quark.cn/s/33060e1ee34c ；"
+                "魔塔 https://modelscope.cn/models/iic/speech_flatsepreformer_separation_temporal_8k_base_libri2mix100"
+            ) from e
+    print(f"[FlatSepReformer] 模型下载完成: {os.path.abspath(model_dir)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -417,9 +454,14 @@ class FlatSepReformerSeparate:
                  output_gain: float = 1.0, match_input_sr: bool = False):
         model_dir = find_model_dir()
         if not model_dir:
+            # 运行时自动下载到默认目标文件夹: <ComfyUI>/models/FlatSepReformer
+            target = _default_model_dir()
+            _auto_download_model(target)
+            model_dir = find_model_dir(target)
+        if not model_dir:
             raise RuntimeError(
-                "未找到模型目录。请将模型放到 <ComfyUI>/models/FlatSepReformer/ "
-                "（运行 python install.py 自动下载），"
+                "未找到模型目录。请确认模型已放入 <ComfyUI>/models/FlatSepReformer/ "
+                "（运行节点会自动下载；也可用夸克网盘或魔塔下载后放入），"
                 "或设置环境变量 FLATSEPREFORMER_MODEL_DIR。")
 
         model = _load_model(model_dir, backend, device)

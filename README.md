@@ -7,7 +7,9 @@
 输入一段两人混合语音，输出两路独立的说话人语音。
 
 > 模型许可证：CC BY-NC 4.0（非商业用途）。模型权重不随本仓库分发，
-> 请运行 `python install.py` 自动下载到 `<ComfyUI>/models/FlatSepReformer/`。
+> 首次运行节点时会**自动下载**，也可用下方三种方式之一手动获取。
+
+![节点展示](assets/screenshot.png)
 
 ---
 
@@ -49,19 +51,43 @@ pip install -r requirements.txt
 >
 > 如果只想用 `onnx` 后端，可跳过 modelscope。
 
-### 3. 下载模型到指定目录
+### 3. 下载模型（三种方式任选其一）
+
+模型文件需存放在目标文件夹：
+
+> **目标文件夹：`<ComfyUI>/models/FlatSepReformer/`**
+>
+> 包含 3 个文件（共约 120 MB）：`configuration.json`、`pytorch_model.pt`、`onnx_model.onnx`
+
+**方式 ①：ComfyUI 运行时自动下载（推荐，无需任何操作）**
+
+节点**首次运行时**会自动检测目标文件夹；若模型不存在，自动从 ModelScope
+下载到 `<ComfyUI>/models/FlatSepReformer/`，控制台会显示下载进度。
+
+**方式 ②：夸克网盘下载**
+
+网盘链接：https://pan.quark.cn/s/33060e1ee34c
+
+下载解压后，把 `FlatSepReformer` 整个文件夹放到 `<ComfyUI>/models/` 目录下。
+
+**方式 ③：魔塔（ModelScope）下载**
+
+模型主页：https://modelscope.cn/models/iic/speech_flatsepreformer_separation_temporal_8k_base_libri2mix100
 
 ```bash
-python install.py
-# 或手动指定 ComfyUI 根目录
-COMFYUI_PATH=D:/ComfyUI python install.py
+# 方式 3a：命令行下载
+pip install modelscope
+modelscope download --model iic/speech_flatsepreformer_separation_temporal_8k_base_libri2mix100 --local_dir <ComfyUI>/models/FlatSepReformer
+
+# 方式 3b：代码下载
+# python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('iic/speech_flatsepreformer_separation_temporal_8k_base_libri2mix100', local_dir=r'<ComfyUI>/models/FlatSepReformer')"
 ```
 
-模型会下载到 **`<ComfyUI>/models/FlatSepReformer/`**（约 60 MB）：
-`configuration.json`、`pytorch_model.pt`、`onnx_model.onnx`、`README.md` 等。
+也可在模型主页手动下载 `configuration.json`、`pytorch_model.pt`、`onnx_model.onnx`
+三个文件放入目标文件夹。
 
-> 也可手动从 [ModelScope](https://modelscope.cn/models/iic/speech_flatsepreformer_separation_temporal_8k_base_libri2mix100)
-> 下载模型文件放入该目录；或设置环境变量 `FLATSEPREFORMER_MODEL_DIR` 指向自定义目录。
+> 提示：也可运行 `python install.py` 自动下载到默认位置；或设置环境变量
+> `FLATSEPREFORMER_MODEL_DIR` 指向自定义目录。
 
 ### 4. 重启 ComfyUI
 
@@ -174,3 +200,10 @@ modelscope 是 PyPI 版，其 pipeline 注册表还没有这个新模型。两�
 
 - 模型：[ModelScope iic / speech_flatsepreformer_separation_temporal_8k_base_libri2mix100](https://modelscope.cn/models/iic/speech_flatsepreformer_separation_temporal_8k_base_libri2mix100)
 - [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
+
+## 📞 联系作者
+
+- 微信：`qrock168`
+- QQ：`1416655191`
+
+有问题、需求或合作欢迎联系。
