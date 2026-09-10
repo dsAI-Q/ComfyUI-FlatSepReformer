@@ -342,6 +342,27 @@ class FlatSepReformerSeparate:
     """
 
     @classmethod
+    def DESCRIPTION(cls) -> str:
+        return (
+            "【双说话人语音分离】\n"
+            "把一段两人混合语音分离为两路独立人声（自动加载 "
+            "<ComfyUI>/models/FlatSepReformer 模型，无需填路径）。\n\n"
+            "【4 个可调参数 · 使用说明】\n"
+            "1. gate_mode（门控模式）——解决交替对话/夹杂问题：\n"
+            "   · off  ：不处理，输出模型原始结果（默认）\n"
+            "   · soft ：按能量平滑压低非活跃段，不硬切，适合轻微夹杂\n"
+            "   · hard ：低于阈值的段落直接静音，夹杂严重时用\n"
+            "2. gate_threshold（门控阈值）：相对峰值 0.5 的比例，\n"
+            "   建议 0.02 起调；越小越灵敏（易误伤弱语音），越大抑制越强\n"
+            "3. output_gain（输出增益）：补偿分离后音量，范围 0.1~4.0，\n"
+            "   偏小就调大（如 1.5~2.0），过大可能削波\n"
+            "4. match_input_sr（输出采样率匹配）：输入非 8k 时开启，\n"
+            "   输出回到原采样率，避免 8k 高频截止导致听感偏闷\n\n"
+            "【能力边界】模型为 8kHz 干净双说话人分离，不含去噪/去背景音；\n"
+            "背景音需先用 UVR、Demucs 等专用工具去除后再送入本节点。"
+        )
+
+    @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
@@ -349,36 +370,41 @@ class FlatSepReformerSeparate:
                 "backend": (
                     ["auto", "onnx", "modelscope"],
                     {"default": "auto",
-                     "tooltip": "auto: 优先 onnx（无需 modelscope，推荐）；"
-                                "onnx: 使用 onnx_model.onnx；"
-                                "modelscope: 使用 pytorch_model.pt（需 master 版 modelscope）"},
+                     "tooltip": "推理后端：auto=优先 onnx（无需 modelscope，推荐）；"
+                                "onnx=使用 onnx_model.onnx；"
+                                "modelscope=使用 pytorch_model.pt（需 master 版 modelscope）"},
                 ),
                 "device": (
                     ["auto", "cpu", "cuda"],
-                    {"default": "auto", "tooltip": "auto: 有 CUDA 用 GPU，否则 CPU"},
+                    {"default": "auto", "tooltip": "计算设备：auto=有 CUDA 用 GPU，否则 CPU"},
                 ),
                 "gate_mode": (
                     ["off", "soft", "hard"],
                     {"default": "off",
-                     "tooltip": "说话人活动门控：抑制非活跃段泄漏（改善交替对话/夹杂）。"
-                                "soft=平滑压低，hard=低于阈值静音，off=不处理"},
+                     "tooltip": "门控模式（解决交替对话/夹杂）：off=不处理，输出模型原始结果；"
+                                "soft=按能量平滑压低非活跃段，不硬切，适合轻微夹杂；"
+                                "hard=低于阈值的段落直接静音（带30ms淡入淡出防咔哒），夹杂严重时用。"
+                                "交替对话、男声通道夹杂女声时建议开启"},
                 ),
                 "gate_threshold": (
                     "FLOAT",
                     {"default": 0.02, "min": 0.001, "max": 0.5, "step": 0.001,
-                     "tooltip": "门控阈值（相对该路峰值的比例）。越小越灵敏、越容易误伤弱语音；"
-                                "越大抑制越强。"},
+                     "tooltip": "门控阈值（相对该路峰值 0.5 的比例）。"
+                                "越小越灵敏，容易把轻语音也压掉；越大抑制越强。"
+                                "建议 0.02 起调，夹杂仍重就逐步加大到 0.05~0.1"},
                 ),
                 "output_gain": (
                     "FLOAT",
                     {"default": 1.0, "min": 0.1, "max": 4.0, "step": 0.1,
-                     "tooltip": "输出增益，补偿分离后音量（>1 放大，<1 衰减）"},
+                     "tooltip": "输出增益：分离后音量偏小就调大（如 1.5~2.0），"
+                                "偏大就调小；超过 1.0 的部分会被截断（削波）"},
                 ),
                 "match_input_sr": (
                     "BOOLEAN",
                     {"default": False,
-                     "tooltip": "输出采样率匹配输入（否则固定 8000 Hz；"
-                                "8k 输出高频截止 4k，听感偏闷时可开启）"},
+                     "tooltip": "输出采样率匹配输入音频。模型固定输出 8000Hz"
+                                "（高频截止 4kHz，听感偏闷）；输入是 44.1k/48k 等时"
+                                "开启可让输出回到原采样率，听感更清晰；关闭则输出固定 8000Hz"},
                 ),
             }
         }
@@ -434,6 +460,15 @@ class FlatSepReformerLoadAudio:
     """从本地文件加载音频（wav/flac/ogg/mp3 等 soundfile 支持的格式）。"""
 
     @classmethod
+    def DESCRIPTION(cls) -> str:
+        return (
+            "【加载音频】\n"
+            "从本地文件读取音频（wav/flac/ogg/mp3 等 soundfile 支持的格式），\n"
+            "输出标准 AUDIO（waveform + sample_rate），可直接连接分离节点。\n"
+            "路径填音频文件的绝对路径；采样率任意，分离节点会自动重采样到 8000Hz。"
+        )
+
+    @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
@@ -461,6 +496,15 @@ class FlatSepReformerLoadAudio:
 
 class FlatSepReformerSaveAudio:
     """将 AUDIO 保存为 wav 文件，返回保存路径。"""
+
+    @classmethod
+    def DESCRIPTION(cls) -> str:
+        return (
+            "【保存音频】\n"
+            "把 AUDIO 保存为 wav 文件，输出保存路径。\n"
+            "filename 填文件名（不含扩展名，自动加 .wav）；\n"
+            "output_dir 留空则保存到 <ComfyUI>/output/ 目录。"
+        )
 
     @classmethod
     def INPUT_TYPES(cls):
