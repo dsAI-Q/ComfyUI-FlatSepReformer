@@ -341,26 +341,24 @@ class FlatSepReformerSeparate:
       * match_input_sr : 输出采样率匹配输入（默认固定 8000 Hz）。
     """
 
-    @classmethod
-    def DESCRIPTION(cls) -> str:
-        return (
-            "【双说话人语音分离】\n"
-            "把一段两人混合语音分离为两路独立人声（自动加载 "
-            "<ComfyUI>/models/FlatSepReformer 模型，无需填路径）。\n\n"
-            "【4 个可调参数 · 使用说明】\n"
-            "1. gate_mode（门控模式）——解决交替对话/夹杂问题：\n"
-            "   · off  ：不处理，输出模型原始结果（默认）\n"
-            "   · soft ：按能量平滑压低非活跃段，不硬切，适合轻微夹杂\n"
-            "   · hard ：低于阈值的段落直接静音，夹杂严重时用\n"
-            "2. gate_threshold（门控阈值）：相对峰值 0.5 的比例，\n"
-            "   建议 0.02 起调；越小越灵敏（易误伤弱语音），越大抑制越强\n"
-            "3. output_gain（输出增益）：补偿分离后音量，范围 0.1~4.0，\n"
-            "   偏小就调大（如 1.5~2.0），过大可能削波\n"
-            "4. match_input_sr（输出采样率匹配）：输入非 8k 时开启，\n"
-            "   输出回到原采样率，避免 8k 高频截止导致听感偏闷\n\n"
-            "【能力边界】模型为 8kHz 干净双说话人分离，不含去噪/去背景音；\n"
-            "背景音需先用 UVR、Demucs 等专用工具去除后再送入本节点。"
-        )
+    DESCRIPTION = (
+        "【双说话人语音分离】\n"
+        "把一段两人混合语音分离为两路独立人声（自动加载 "
+        "<ComfyUI>/models/FlatSepReformer 模型，无需填路径）。\n\n"
+        "【4 个可调参数 · 使用说明】\n"
+        "1. gate_mode（门控模式）——解决交替对话/夹杂问题：\n"
+        "   · off  ：不处理，输出模型原始结果（默认）\n"
+        "   · soft ：按能量平滑压低非活跃段，不硬切，适合轻微夹杂\n"
+        "   · hard ：低于阈值的段落直接静音，夹杂严重时用\n"
+        "2. gate_threshold（门控阈值）：相对峰值 0.5 的比例，\n"
+        "   建议 0.02 起调；越小越灵敏（易误伤弱语音），越大抑制越强\n"
+        "3. output_gain（输出增益）：补偿分离后音量，范围 0.1~4.0，\n"
+        "   偏小就调大（如 1.5~2.0），过大可能削波\n"
+        "4. match_input_sr（输出采样率匹配）：输入非 8k 时开启，\n"
+        "   输出回到原采样率，避免 8k 高频截止导致听感偏闷\n\n"
+        "【能力边界】模型为 8kHz 干净双说话人分离，不含去噪/去背景音；\n"
+        "背景音需先用 UVR、Demucs 等专用工具去除后再送入本节点。"
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -459,14 +457,12 @@ class FlatSepReformerSeparate:
 class FlatSepReformerLoadAudio:
     """从本地文件加载音频（wav/flac/ogg/mp3 等 soundfile 支持的格式）。"""
 
-    @classmethod
-    def DESCRIPTION(cls) -> str:
-        return (
-            "【加载音频】\n"
-            "从本地文件读取音频（wav/flac/ogg/mp3 等 soundfile 支持的格式），\n"
-            "输出标准 AUDIO（waveform + sample_rate），可直接连接分离节点。\n"
-            "路径填音频文件的绝对路径；采样率任意，分离节点会自动重采样到 8000Hz。"
-        )
+    DESCRIPTION = (
+        "【加载音频】\n"
+        "从本地文件读取音频（wav/flac/ogg/mp3 等 soundfile 支持的格式），\n"
+        "输出标准 AUDIO（waveform + sample_rate），可直接连接分离节点。\n"
+        "路径填音频文件的绝对路径；采样率任意，分离节点会自动重采样到 8000Hz。"
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -497,14 +493,12 @@ class FlatSepReformerLoadAudio:
 class FlatSepReformerSaveAudio:
     """将 AUDIO 保存为 wav 文件，返回保存路径。"""
 
-    @classmethod
-    def DESCRIPTION(cls) -> str:
-        return (
-            "【保存音频】\n"
-            "把 AUDIO 保存为 wav 文件，输出保存路径。\n"
-            "filename 填文件名（不含扩展名，自动加 .wav）；\n"
-            "output_dir 留空则保存到 <ComfyUI>/output/ 目录。"
-        )
+    DESCRIPTION = (
+        "【保存音频】\n"
+        "把 AUDIO 保存为 wav 文件，输出保存路径。\n"
+        "filename 填文件名（不含扩展名，自动加 .wav）；\n"
+        "output_dir 留空则保存到 <ComfyUI>/output/ 目录。"
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
