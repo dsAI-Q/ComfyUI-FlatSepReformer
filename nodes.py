@@ -163,6 +163,50 @@ def _peak_norm(signal: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+# 后处理: 说话人活动门控（改善交替对话 / 非活跃段泄漏）
+# --------------------------------------------------------------------------- #
+def _frame_rms(x: np.ndarray, frame: int, hop: int) -> np.ndarray:
+    """逐帧 RMS 能量（25ms 帧 / 10ms 步进，8000 Hz）。"""
+    n = max(1, (len(x) - frame) // hop + 1)
+    idx = np.arange(n)[:, None] * hop + np.arange(frame)[None, :]
+    idx = idx[idx.max(axis=1) < len(x)]
+    seg = x[idx]
+    return np.sqrt(np.mean(seg ** 2, axis=1)).astype(np.float32)
+
+
+def _apply_gate(waveform: np.ndarray, mode: str, threshold: float) -> np.ndarray:
+    """说话人活动门控。
+
+    - mode=off : 不处理
+    - mode=soft: 按能量比例平滑压低非活跃段（不硬切，保留弱语音）
+    - mode=hard: 低于阈值段静音（带 ~30ms 淡入淡出避免咔哒声）
+
+    threshold 是相对该路峰值 0.5 的比例（gate_threshold 参数）。
+    """
+    if mode == "off" or len(waveform) == 0:
+        return waveform
+    fs = TARGET_SAMPLE_RATE
+    frame = int(0.025 * fs)
+    hop = int(0.010 * fs)
+    rms = _frame_rms(waveform, frame, hop)
+    peak = float(np.abs(waveform).max())
+    thr = max(peak, 1e-9) * float(threshold)
+
+    if mode == "hard":
+        gain = (rms >= thr).astype(np.float32)
+        kernel = np.ones(3) / 3.0                 # ~30ms 边缘平滑
+    else:  # soft
+        ratio = rms / (thr + 1e-12)
+        gain = np.clip(ratio, 0.0, 1.0) ** 0.5    # 平方根: 平滑压低
+        kernel = np.ones(5) / 5.0                 # ~50ms 时间平滑
+    gain = np.convolve(gain, kernel, mode="same")
+
+    frame_pos = np.arange(len(waveform)) // hop
+    frame_pos = np.clip(frame_pos, 0, len(gain) - 1)
+    return (waveform * gain[frame_pos]).astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
 # 推理后端
 # --------------------------------------------------------------------------- #
 def _resolve_device(device: str) -> str:
@@ -286,13 +330,15 @@ def _infer_modelscope(pipeline_obj, waveform: np.ndarray) -> list[np.ndarray]:
 # 合并节点: 模型加载 + 语音分离（v2）
 # --------------------------------------------------------------------------- #
 class FlatSepReformerSeparate:
-    """双说话人语音分离（自动加载模型）。
+    """双说话人语音分离（自动加载模型 + 可调后处理）。
 
-    - 模型自动从 <ComfyUI>/models/FlatSepReformer 加载（相对插件路径推导），
-      无需单独加载节点、无需填绝对路径。
-    - backend=auto 时优先使用 ONNX（无需 modelscope），
-      modelscope 仅作为可选项。
-    - 输入音频自动重采样到 8000 Hz。
+    - 模型自动从 <ComfyUI>/models/FlatSepReformer 加载（相对插件路径推导）。
+    - backend=auto 时优先使用 ONNX（无需 modelscope）。
+    - 后处理参数（按场景手动调节）:
+      * gate_mode / gate_threshold : 说话人活动门控，抑制交替对话等场景的
+        非活跃段泄漏（如男声通道夹杂女声）。soft 平滑压低，hard 阈值静音。
+      * output_gain : 输出音量增益。
+      * match_input_sr : 输出采样率匹配输入（默认固定 8000 Hz）。
     """
 
     @classmethod
@@ -311,6 +357,29 @@ class FlatSepReformerSeparate:
                     ["auto", "cpu", "cuda"],
                     {"default": "auto", "tooltip": "auto: 有 CUDA 用 GPU，否则 CPU"},
                 ),
+                "gate_mode": (
+                    ["off", "soft", "hard"],
+                    {"default": "off",
+                     "tooltip": "说话人活动门控：抑制非活跃段泄漏（改善交替对话/夹杂）。"
+                                "soft=平滑压低，hard=低于阈值静音，off=不处理"},
+                ),
+                "gate_threshold": (
+                    "FLOAT",
+                    {"default": 0.02, "min": 0.001, "max": 0.5, "step": 0.001,
+                     "tooltip": "门控阈值（相对该路峰值的比例）。越小越灵敏、越容易误伤弱语音；"
+                                "越大抑制越强。"},
+                ),
+                "output_gain": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.1, "max": 4.0, "step": 0.1,
+                     "tooltip": "输出增益，补偿分离后音量（>1 放大，<1 衰减）"},
+                ),
+                "match_input_sr": (
+                    "BOOLEAN",
+                    {"default": False,
+                     "tooltip": "输出采样率匹配输入（否则固定 8000 Hz；"
+                                "8k 输出高频截止 4k，听感偏闷时可开启）"},
+                ),
             }
         }
 
@@ -319,7 +388,9 @@ class FlatSepReformerSeparate:
     FUNCTION = "separate"
     CATEGORY = "audio/separation"
 
-    def separate(self, audio: dict, backend: str = "auto", device: str = "auto"):
+    def separate(self, audio: dict, backend: str = "auto", device: str = "auto",
+                 gate_mode: str = "off", gate_threshold: float = 0.02,
+                 output_gain: float = 1.0, match_input_sr: bool = False):
         model_dir = find_model_dir()
         if not model_dir:
             raise RuntimeError(
@@ -329,20 +400,31 @@ class FlatSepReformerSeparate:
 
         model = _load_model(model_dir, backend, device)
 
-        waveform, sr = _to_mono_float32(audio)
+        waveform, input_sr = _to_mono_float32(audio)
         if len(waveform) == 0:
             raise ValueError("输入音频为空")
-        if sr != TARGET_SAMPLE_RATE:
-            waveform = _resample(waveform, sr, TARGET_SAMPLE_RATE)
+        if input_sr != TARGET_SAMPLE_RATE:
+            waveform = _resample(waveform, input_sr, TARGET_SAMPLE_RATE)
 
         spks = (_infer_onnx(model["session"], waveform)
                 if model["backend"] == "onnx"
                 else _infer_modelscope(model["pipeline"], waveform))
 
-        return (
-            _to_audio_dict(spks[0], TARGET_SAMPLE_RATE),
-            _to_audio_dict(spks[1], TARGET_SAMPLE_RATE),
-        )
+        # ---- 后处理（可调参数）----
+        outs = []
+        for spk in spks:
+            if gate_mode != "off":
+                spk = _apply_gate(spk, gate_mode, gate_threshold)
+            spk = _peak_norm(spk)                     # 门控后重新归一化峰值 0.5
+            if output_gain != 1.0:
+                spk = np.clip(spk * float(output_gain), -1.0, 1.0)
+            out_sr = TARGET_SAMPLE_RATE
+            if match_input_sr and input_sr != TARGET_SAMPLE_RATE:
+                spk = _resample(spk, TARGET_SAMPLE_RATE, input_sr)
+                out_sr = input_sr
+            outs.append(_to_audio_dict(spk, out_sr))
+
+        return (outs[0], outs[1])
 
 
 # --------------------------------------------------------------------------- #

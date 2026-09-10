@@ -94,6 +94,23 @@ def main() -> None:
     assert r1["sample_rate"] == 8000
     print(f"[6] Resample OK: {fake_sr}Hz -> 8000Hz, out_len={r1['waveform'].shape[-1]}")
 
+    # [7] 门控后处理: hard 抑制静音段 / soft 压低
+    sig = np.concatenate([np.full(8000, 0.3, np.float32), np.zeros(8000, np.float32)])
+    g_hard = nodes._apply_gate(sig, "hard", 0.05)
+    g_soft = nodes._apply_gate(sig, "soft", 0.05)
+    assert np.abs(g_hard[10000:]).max() < 1e-3, "hard gate 未静音尾部"
+    assert np.abs(g_hard[:3000]).max() > 0.2, "hard gate 误伤语音段"
+    assert np.abs(g_soft[10000:]).max() < 0.05, "soft gate 未压低尾部"
+    print(f"[7] Gate OK (hard 尾段峰值={np.abs(g_hard[10000:]).max():.4f}, "
+          f"soft 尾段峰值={np.abs(g_soft[10000:]).max():.4f})")
+
+    # [8] output_gain + match_input_sr
+    g1, g2 = sep.separate(fake_audio, "auto", "cpu", "off", 0.02, 2.0, True)
+    assert g1["sample_rate"] == fake_sr, g1["sample_rate"]
+    peak_out = float(np.abs(g1["waveform"][0, 0].numpy()).max())
+    assert peak_out > 0.9, f"gain 2.0 后峰值应接近 1.0，实际 {peak_out}"
+    print(f"[8] Gain+MatchSR OK: 输出sr={g1['sample_rate']}, 峰值={peak_out:.3f}")
+
     print("\nALL TESTS PASSED")
 
 
