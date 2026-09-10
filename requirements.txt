@@ -1,0 +1,10 @@
+# 核心依赖（torch 由 ComfyUI 环境提供，无需重复安装）
+numpy>=1.24
+soundfile>=0.12
+scipy>=1.10
+onnxruntime>=1.17
+
+# ModelScope（modelscope 后端需要；模型卡要求使用最新源码:
+#   pip install -U "modelscope @ git+https://github.com/modelscope/modelscope.git@master"
+# 若仅使用 onnx 后端，可以注释掉下面这行）
+modelscope @ git+https://github.com/modelscope/modelscope.git@master

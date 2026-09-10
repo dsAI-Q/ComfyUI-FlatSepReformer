@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 模型权重（约 60MB，不提交到 git，用 python install.py 下载）
+models/
+*.pt
+*.onnx
+
+# 输出音频
+output/
+*.wav
+
+# 环境与 IDE
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
