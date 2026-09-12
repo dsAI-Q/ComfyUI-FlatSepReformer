@@ -23,6 +23,10 @@
 - 🎚 **互斥门控（gate_mode=mutual）**：专治两人轮流说话的交替对话（如影视对白）——
   逐帧比较两路能量，某路明显占优时压低另一路的泄漏/串扰，两路都更干净；
   重叠说话段不误伤
+- 🔧 **空洞修复（repair_mode=auto）**：模型对影视对白的弱音节（如"咦""唇""破"）
+  常整体掩蔽丢弃，导致 speaker_1 丢字、内容跑进 speaker_2。开启后自动检测空洞、
+  局部窗口重分离找回弱音节补回 speaker_1，并清理 speaker_2 重复；**音区校验 +
+  句内延续校验**确保对方说话人的内容（男声）不会被误补进 spk1
 - 🚀 **双推理后端（auto 自动选择）**：
   - `onnx`：使用 `onnx_model.onnx`，基于 ONNX Runtime，**无需安装 modelscope**（默认优先）
   - `modelscope`：使用 `pytorch_model.pt`（需 master 源码版）
@@ -104,9 +108,15 @@ modelscope download --model iic/speech_flatsepreformer_separation_temporal_8k_ba
 
 | 节点 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| **FlatSepReformer (Separate 2 Speakers)** | `audio`、`backend`、`device`、`output_order`、`gate_mode`、`gate_threshold`、`mutual_threshold`、`gender_f0_threshold`、`output_gain`、`match_input_sr` | `speaker_1`、`speaker_2` | **合并节点**：自动加载 `<ComfyUI>/models/FlatSepReformer` 模型并分离双说话人。`backend` 默认 `auto`（优先 onnx，无需 modelscope）。`output_order` 默认 `auto`（固定 speaker_1 = 较正常的人声，质量接近时女声优先） |
+| **FlatSepReformer (Separate 2 Speakers)** | `audio`、`backend`、`device`、`output_order`、`gate_mode`、`gate_threshold`、`mutual_threshold`、`gender_f0_threshold`、`output_gain`、`match_input_sr`、`repair_mode`、`repair_min_hole`、`repair_pad` | `speaker_1`、`speaker_2` | **合并节点**：自动加载 `<ComfyUI>/models/FlatSepReformer` 模型并分离双说话人。`backend` 默认 `auto`（优先 onnx，无需 modelscope）。`output_order` 默认 `auto`（固定 speaker_1 = 较正常的人声，质量接近时女声优先）。`repair_mode=auto` 开启空洞修复（找回被模型吞掉的弱音节，见下文） |
 | **Load Audio (FlatSepReformer)** | `audio_path` | `audio` | 加载 wav/flac/ogg/mp3 等格式音频文件 |
 | **Save Audio (FlatSepReformer)** | `audio`、`filename`、`output_dir` | `filepath` | 保存为 wav，返回保存路径（默认 `<ComfyUI>/output/`） |
+
+> v2.2 变更：新增 `repair_mode=auto` 空洞修复。模型对影视对白的弱音节（如
+> "咦""唇""破"等）常直接掩蔽丢弃，导致 speaker_1 丢字/缺内容。开启后节点自动：
+> 检测 spk1 静音空洞 → 以空洞为窗口重新分离（局部窗口的掩蔽模式与全段不同，
+> 弱音节能保住）→ 经**音区校验 + 句内延续校验**确认是 spk1 说话人的内容后补回
+> spk1，并同步清理 spk2 的重复；对方说话人的内容（男声）不会被误补进 spk1。
 
 > v2.1 变更：新增 `output_order`（固定 speaker_1 的输出排序）与 `gate_mode=mutual`
 > （互斥门控，交替对话专用）。**旧工作流不受影响**（新增参数都有默认值）。
@@ -124,7 +134,16 @@ modelscope download --model iic/speech_flatsepreformer_separation_temporal_8k_ba
 2. **Separate**：连接 audio，`backend` 留 `auto`、`device` 留 `auto` 即可（自动加载模型）
 3. **Save Audio ×2**：分别接 `speaker_1`、`speaker_2`，设置文件名
 
-`examples/workflow.json` 提供可直接导入的 API 格式示例工作流。
+`examples/workflow.json` 提供可直接导入的完整示例工作流（下图），包含：
+**VHS_LoadVideo（读视频音轨）→ AudioSeparation（背景音消除，UVR 类模型）→
+FlatSepReformerSeparate（`repair_mode=auto`）→ PreviewAudio ×2**。
+
+> ⚠️ 该示例工作流使用第三方节点：`VHS_LoadVideo`（VideoHelperSuite）与
+> `AudioSeparation`（audio-separation-nodes-comfyui），需先在 ComfyUI Manager 安装。
+> 若不需要背景音消除，可直接用 **Load Audio** 节点把处理好的干净语音接入
+> `FlatSepReformerSeparate`。
+
+![示例工作流](assets/screenshot.png)
 
 ## ✅ 测试
 
