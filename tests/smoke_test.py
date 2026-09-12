@@ -52,9 +52,9 @@ def main() -> None:
     print(f"[1] LoadAudio OK: sr={audio['sample_rate']} "
           f"shape={tuple(audio['waveform'].shape)}")
 
-    # [2] 合并节点: backend=auto（应解析为 onnx）
+    # [2] 合并节点: backend=auto（应解析为 onnx）；as_is 保持原始顺序便于后端对比
     sep = nodes.FlatSepReformerSeparate()
-    s1, s2 = sep.separate(audio, "auto", "cpu")
+    s1, s2 = sep.separate(audio, "auto", "cpu", output_order="as_is")
     w1, w2 = s1["waveform"][0, 0].numpy(), s2["waveform"][0, 0].numpy()
     assert s1["sample_rate"] == 8000 and s2["sample_rate"] == 8000
     assert w1.shape == w2.shape, (w1.shape, w2.shape)
@@ -75,7 +75,7 @@ def main() -> None:
     print(f"[4] SaveAudio OK:\n    {p1}\n    {p2}")
 
     # [5] backend=modelscope
-    ms1, ms2 = sep.separate(audio, "modelscope", "cpu")
+    ms1, ms2 = sep.separate(audio, "modelscope", "cpu", output_order="as_is")
     wm1, wm2 = ms1["waveform"][0, 0].numpy(), ms2["waveform"][0, 0].numpy()
     assert wm1.shape == wm2.shape
     assert float(np.abs(wm1).max()) > 0.01 and float(np.abs(wm2).max()) > 0.01
@@ -105,11 +105,27 @@ def main() -> None:
           f"soft 尾段峰值={np.abs(g_soft[10000:]).max():.4f})")
 
     # [8] output_gain + match_input_sr
-    g1, g2 = sep.separate(fake_audio, "auto", "cpu", "off", 0.02, 2.0, True)
+    g1, g2 = sep.separate(fake_audio, "auto", "cpu", output_order="as_is",
+                          gate_mode="off", gate_threshold=0.02,
+                          output_gain=2.0, match_input_sr=True)
     assert g1["sample_rate"] == fake_sr, g1["sample_rate"]
     peak_out = float(np.abs(g1["waveform"][0, 0].numpy()).max())
     assert peak_out > 0.9, f"gain 2.0 后峰值应接近 1.0，实际 {peak_out}"
     print(f"[8] Gain+MatchSR OK: 输出sr={g1['sample_rate']}, 峰值={peak_out:.3f}")
+
+    # [9] 互斥门控 + 输出排序（固定 speaker_1）：端到端跑通且两路都是人声
+    m1, m2 = sep.separate(audio, "auto", "cpu", output_order="quality",
+                          gate_mode="mutual", mutual_threshold=0.25)
+    wm1, wm2 = m1["waveform"][0, 0].numpy(), m2["waveform"][0, 0].numpy()
+    assert m1["sample_rate"] == 8000 and m2["sample_rate"] == 8000
+    assert float(np.abs(wm1).max()) > 0.01 and float(np.abs(wm2).max()) > 0.01
+    # 排序后 speaker_1 的质量分应不低于 speaker_2（quality 模式硬保证）
+    a1 = nodes._analyze_speech(wm1)
+    a2 = nodes._analyze_speech(wm2)
+    assert a1["quality"] >= a2["quality"] - 1e-6, \
+        f"quality 模式下 speaker_1 质量应最高: {a1['quality']:.3f} < {a2['quality']:.3f}"
+    print(f"[9] MutualGate+Ordering OK: spk1质量={a1['quality']:.3f} "
+          f"spk2质量={a2['quality']:.3f} F0={a1['median_f0']:.0f}/{a2['median_f0']:.0f}Hz")
 
     print("\nALL TESTS PASSED")
 

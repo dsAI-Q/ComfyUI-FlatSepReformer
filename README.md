@@ -16,6 +16,13 @@
 ## ✨ 特性
 
 - 🎛 **3 个即插即用节点**：分离节点已合并"模型加载 + 语音分离"，开箱即用
+- 🎚 **固定 speaker_1 的输出排序（output_order）**：模型是置换不变训练（PIT），
+  原始输出哪路对应谁不固定。节点自动按"语音质量分 + 基频性别检测"重排：
+  `auto` 保证 speaker_1 一定是较正常的人声（质量优先），质量接近时女声固定到
+  speaker_1；也可强制 `female`（女声固定 spk1）/ `quality`（仅按质量）/ `as_is`
+- 🎚 **互斥门控（gate_mode=mutual）**：专治两人轮流说话的交替对话（如影视对白）——
+  逐帧比较两路能量，某路明显占优时压低另一路的泄漏/串扰，两路都更干净；
+  重叠说话段不误伤
 - 🚀 **双推理后端（auto 自动选择）**：
   - `onnx`：使用 `onnx_model.onnx`，基于 ONNX Runtime，**无需安装 modelscope**（默认优先）
   - `modelscope`：使用 `pytorch_model.pt`（需 master 源码版）
@@ -24,7 +31,7 @@
 - 🔄 **自动重采样**：任意采样率的输入音频自动重采样到 8000 Hz
 - 💾 **模型缓存**：同一配置只加载一次，重复执行不重复占显存
 - 🎚 **双后端输出一致**：ONNX 与 modelscope 后端均按峰值归一化到 0.5（与官方 pipeline 后处理一致），相关系数 > 0.9999
-- 🎛 **可调后处理参数**：说话人活动门控（改善交替对话/夹杂）、输出增益、输出采样率匹配
+- 🎛 **可调后处理参数**：说话人活动门控（soft/hard/mutual 三档，改善交替对话/夹杂）、输出增益、输出采样率匹配
 
 ## 📦 安装
 
@@ -97,9 +104,12 @@ modelscope download --model iic/speech_flatsepreformer_separation_temporal_8k_ba
 
 | 节点 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| **FlatSepReformer (Separate 2 Speakers)** | `audio`、`backend`、`device` | `speaker_1`、`speaker_2` | **合并节点**：自动加载 `<ComfyUI>/models/FlatSepReformer` 模型并分离双说话人。`backend` 默认 `auto`（优先 onnx，无需 modelscope） |
+| **FlatSepReformer (Separate 2 Speakers)** | `audio`、`backend`、`device`、`output_order`、`gate_mode`、`gate_threshold`、`mutual_threshold`、`gender_f0_threshold`、`output_gain`、`match_input_sr` | `speaker_1`、`speaker_2` | **合并节点**：自动加载 `<ComfyUI>/models/FlatSepReformer` 模型并分离双说话人。`backend` 默认 `auto`（优先 onnx，无需 modelscope）。`output_order` 默认 `auto`（固定 speaker_1 = 较正常的人声，质量接近时女声优先） |
 | **Load Audio (FlatSepReformer)** | `audio_path` | `audio` | 加载 wav/flac/ogg/mp3 等格式音频文件 |
 | **Save Audio (FlatSepReformer)** | `audio`、`filename`、`output_dir` | `filepath` | 保存为 wav，返回保存路径（默认 `<ComfyUI>/output/`） |
+
+> v2.1 变更：新增 `output_order`（固定 speaker_1 的输出排序）与 `gate_mode=mutual`
+> （互斥门控，交替对话专用）。**旧工作流不受影响**（新增参数都有默认值）。
 
 > v2 变更：原 `FlatSepReformerLoader` + `FlatSepReformerSeparate` 两个节点已合并为
 > `FlatSepReformerSeparate` 单节点（输入 `audio`，自动加载模型）。请删除工作流中旧的
@@ -120,10 +130,11 @@ modelscope download --model iic/speech_flatsepreformer_separation_temporal_8k_ba
 
 ```bash
 cd ComfyUI-FlatSepReformer
-python tests/smoke_test.py
+python tests/smoke_test.py        # 端到端冒烟测试（需模型，覆盖 onnx/modelscope 双后端）
+python tests/test_sorting_gate.py # 新增能力单元测试（无需模型：互斥门控/质量分/性别检测/排序）
 ```
 
-冒烟测试覆盖：音频加载 → 模型加载（onnx + modelscope 双后端）→ 双说话人分离 → 音频保存 → 非 8k 输入自动重采样。
+冒烟测试覆盖：音频加载 → 模型加载（onnx + modelscope 双后端）→ 双说话人分离 → 音频保存 → 非 8k 输入自动重采样 → 互斥门控 + 输出排序。
 测试通过标志：`ALL TESTS PASSED`。
 
 ## 🖥 后端选择建议
@@ -158,6 +169,16 @@ $env:FLATSEPREFORMER_MODEL_DIR = "D:/models/FlatSepReformer"
 ```
 
 ## 🛠 常见问题
+
+**Q: speaker_1 / speaker_2 输出的人不固定，有时 speaker_1 是杂音？**
+这是模型的**置换不变训练（PIT）**特性：输出通道与说话人的对应关系不固定，且
+交替对话（训练集为完全重叠语音）下不活跃通道会残留泄漏/杂音。节点已内置解法：
+1. `output_order` 默认 `auto`：按语音质量排序，**质量好的固定为 speaker_1**，
+   不会出现 speaker_1 是杂音；两路质量接近时女声自动固定到 speaker_1。
+   想强制女声在 spk1 选 `female`，恢复旧行为选 `as_is`
+2. `gate_mode=mutual`：交替对话推荐开启，逐帧压低另一路的泄漏，两路都更干净
+3. 想固定"男声=spk2、女声=spk1"，保持 `output_order=auto` 即可（女声次级规则）；
+   性别判定不准时可调 `gender_f0_threshold`（默认 165Hz）
 
 **Q: 报错 `... is not in the pipelines registry group speech-separation`**
 modelscope 是 PyPI 版，其 pipeline 注册表还没有这个新模型。两种解法：
