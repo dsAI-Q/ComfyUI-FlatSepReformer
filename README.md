@@ -237,6 +237,15 @@ $env:FLATSEPREFORMER_MODEL_DIR = "D:/models/FlatSepReformer"
 （内部做了限幅，不会削波爆音）。如果还嫌小，可在后续节点（如 PreviewAudio /
 Save 之后）再接一个增益节点；`window` 兜底输出的音量本身会高于整段分离。
 
+**Q: 为什么 speaker_1 出来的是男声，我选的是 female？**
+极少数音频的男女声学特征与常规相反——**男声比女声更高更亮**（如男声用高音/
+唱腔说话、或男配音演员音色纤细）。此时自动"高质心=女"的判定会**稳定反转**
+（男声被判女、女声被判男）。判定方法：听一下 speaker_1 / speaker_2 哪路是
+女声——如果反了，把节点 **`gender_swap`** 设为 **`on`** 即可交换两路，无需
+改其他参数。注意：这类音频里"男声反常规"是**声学信息极限**（该男声的 F0/
+谱质心就是标准女声形态），任何纯声学算法（含说话人嵌入/性别分类器）都无法
+自动纠偏，只能靠听感确认后手动交换。
+
 **Q: 报错 `... is not in the pipelines registry group speech-separation`**
 modelscope 是 PyPI 版，其 pipeline 注册表还没有这个新模型。两种解法：
 1. **推荐**：节点 `backend` 选 `auto` 或 `onnx`（模型自带 `onnx_model.onnx`，无需 modelscope）

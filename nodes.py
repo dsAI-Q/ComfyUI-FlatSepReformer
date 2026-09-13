@@ -1180,6 +1180,14 @@ class FlatSepReformerSeparate:
                                 "两路都是低质混合内容）时自动改用 4s 短窗口分离兜底；"
                                 "两路都正常时回退原分离逻辑，不影响原结果"},
                 ),
+                "gender_swap": (
+                    ["off", "on"],
+                    {"default": "off",
+                     "tooltip": "性别标签反转（仅 target_speaker 提取生效）：极少数音频的"
+                                "男女声学特征与常规相反（男声比女声更高/更亮，如男声用高音/"
+                                "唱腔说话），自动判定会稳定把男声当女声。听感确认 speaker_1/"
+                                "speaker_2 反了时，把它设为 on 交换两路，无需改其他参数"},
+                ),
             }
         }
 
@@ -1194,7 +1202,8 @@ class FlatSepReformerSeparate:
                  output_order: str = "auto", mutual_threshold: float = 0.25,
                  gender_f0_threshold: float = DEFAULT_GENDER_F0_THRESHOLD,
                  repair_mode: str = "off", repair_min_hole: float = 0.15,
-                 repair_pad: float = 0.3, target_speaker: str = "auto"):
+                 repair_pad: float = 0.3, target_speaker: str = "auto",
+                 gender_swap: str = "off"):
         model_dir = find_model_dir()
         if not model_dir:
             # 运行时自动下载到默认目标文件夹: <ComfyUI>/models/FlatSepReformer
@@ -1250,6 +1259,9 @@ class FlatSepReformerSeparate:
                     f"[FlatSepReformer] target_speaker={target_speaker} 检测到混合语音路"
                     f"（模型未把两人分开），按话语段谱质心聚类提取："
                     f"质心低簇={feats[0]:.0f}Hz 高簇={feats[1]:.0f}Hz")
+                if gender_swap == "on":
+                    spks = [spks[1], spks[0]]
+                    print("[FlatSepReformer] gender_swap=on 已交换两路")
                 # 提取模式下 spk1 已完整，跳过 gate/排序/repair
                 return self._finalize(
                     spks, audio, waveform, output_gain, match_input_sr)
@@ -1275,11 +1287,14 @@ class FlatSepReformerSeparate:
                 if wres is not None:
                     wf, wm = wres
                     spks = [wf, wm] if target_speaker == "female" else [wm, wf]
+                    if gender_swap == "on":
+                        spks = [spks[1], spks[0]]
                     print(
                         "[FlatSepReformer] target_speaker=%s 全局分离疑似失败"
                         "（utts=%d/%d 质量=%.2f/%.2f），启用窗口分离兜底"
-                        "（4s 短窗口分离 + 谱质心性别归类）" % (
-                            target_speaker, _u1, _u2, _q1, _q2))
+                        "（4s 短窗口分离 + 谱质心性别归类%s）" % (
+                            target_speaker, _u1, _u2, _q1, _q2,
+                            "，gender_swap=on 已交换" if gender_swap == "on" else ""))
                     return self._finalize(
                         spks, audio, waveform, output_gain, match_input_sr)
             # 兜底失败或无需兜底 → 走下方原逻辑（gate/排序/repair）
