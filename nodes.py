@@ -835,6 +835,84 @@ def _concat_utterances(x, mask, sr):
     return out
 
 
+def _route_centroid(x, sr, frame=None, hop=None):
+    """一路语音的 utterance 谱质心中位（Hz）；无有效段返回 None。"""
+    if frame is None:
+        frame, hop = int(0.032 * sr), int(0.016 * sr)
+    utts = _split_utterances(x, sr)
+    feats = []
+    for a, b in utts:
+        seg = x[a * hop:min(b * hop, len(x))]
+        c = _utt_spectral_centroid(seg, frame, hop, sr)
+        if c is not None:
+            feats.append(c)
+    return float(np.median(feats)) if feats else None
+
+
+def _place_segment(out, w, st, fade):
+    """把窗口段写入输出（起始/结尾 50ms 淡入淡出，重叠区线性叠加）。"""
+    n = len(w)
+    if st + n > len(out):
+        n = len(out) - st
+        w = w[:n]
+    if n <= 0:
+        return
+    w = w.copy()
+    f = min(fade, n // 2)
+    if f > 0:
+        ramp = np.linspace(0.0, 1.0, f, dtype=np.float32)
+        w[:f] *= ramp
+        w[-f:] *= ramp[::-1]
+    out[st:st + n] += w
+
+
+def _window_fallback(waveform, sr, infer_fn, win_len=4.0, overlap=0.5):
+    """窗口分离兜底：全局分离失败（混合语音路未检出）时用短窗口独立分离。
+
+    模型在短窗口（更接近"完全重叠"的训练分布）下常能正确分开两人，而整段
+    分离会被背景音乐/长上下文干扰（两个真人语音被挤进一路）。每窗口对两路
+    做 utterance 谱质心中位：高质心=女、低质心=男（男女对话的稳定先验），
+    把目标性别窗口段拼回时间轴（重叠区交叉淡化）。
+    返回 (female_wave, male_wave)；无法处理返回 None。
+    """
+    frame, hop = int(0.032 * sr), int(0.016 * sr)
+    W, OV = int(win_len * sr), int(overlap * sr)
+    n = len(waveform)
+    if n < W:
+        return None
+    win_f, win_m = [], []
+    st = 0
+    while st < n:
+        seg = waveform[st:st + W]
+        if len(seg) < int(0.6 * sr):
+            break
+        try:
+            sA, sB = infer_fn(seg)
+        except Exception:
+            break
+        cA, cB = _route_centroid(sA, sr, frame, hop), _route_centroid(sB, sr, frame, hop)
+        if cA is None and cB is None:
+            st += W - OV
+            continue
+        if cA is None or (cB is not None and cB > cA):
+            female, male = sB, sA
+        else:
+            female, male = sA, sB
+        win_f.append((st, st + len(seg), female))
+        win_m.append((st, st + len(seg), male))
+        st += W - OV
+    if not win_f:
+        return None
+    out_f = np.zeros(n, dtype=np.float32)
+    out_m = np.zeros(n, dtype=np.float32)
+    fade = int(0.05 * sr)
+    for st, en, w in win_f:
+        _place_segment(out_f, w, st, fade)
+    for st, en, w in win_m:
+        _place_segment(out_m, w, st, fade)
+    return out_f, out_m
+
+
 
 def _resolve_device(device: str) -> str:
     if device != "auto":
@@ -1097,9 +1175,10 @@ class FlatSepReformerSeparate:
                      "tooltip": "目标说话人（通用兜底）：auto=正常双路分离。当输入含背景音乐"
                                 "或两人音色接近导致模型无法分开时，选 female/male 启用"
                                 "‘目标说话人提取’：自动检测混合语音路，按话语段的谱质心"
-                                "聚类（男低女高），把目标性别的完整话语段输出到 speaker_1，"
-                                "另一人输出到 speaker_2。检测不到混合语音路时自动回退"
-                                "正常分离逻辑，不影响原结果"},
+                                "聚类（男低女高）把目标性别的完整话语段输出到 speaker_1，"
+                                "另一人输出到 speaker_2；全局分离疑似失败（一路是背景音/"
+                                "两路都是低质混合内容）时自动改用 4s 短窗口分离兜底；"
+                                "两路都正常时回退原分离逻辑，不影响原结果"},
                 ),
             }
         }
@@ -1174,6 +1253,36 @@ class FlatSepReformerSeparate:
                 # 提取模式下 spk1 已完整，跳过 gate/排序/repair
                 return self._finalize(
                     spks, audio, waveform, output_gain, match_input_sr)
+
+            # 混合语音路未检出 → 判断全局分离是否"疑似失败"：
+            # 失败特征 = 某路几乎没有语音段（另一路是背景音）或 某路语音质量
+            # 明显偏低（模型把两人混成两份低质内容）。疑似失败才走窗口分离
+            # 兜底；正常分离的音频（两路都有足量清晰语音）回退原逻辑，行为不变。
+            _q1 = _analyze_speech(spks[0], TARGET_SAMPLE_RATE)["quality"]
+            _q2 = _analyze_speech(spks[1], TARGET_SAMPLE_RATE)["quality"]
+            _u1 = len(_split_utterances(spks[0], TARGET_SAMPLE_RATE))
+            _u2 = len(_split_utterances(spks[1], TARGET_SAMPLE_RATE))
+            _suspect = (min(_u1, _u2) < 2 or min(_q1, _q2) < 0.38)
+            if _suspect:
+                infer_fn = ((lambda w: _infer_onnx(model["session"], w))
+                            if model["backend"] == "onnx"
+                            else (lambda w: _infer_modelscope(model["pipeline"], w)))
+                try:
+                    wres = _window_fallback(waveform, TARGET_SAMPLE_RATE, infer_fn)
+                except Exception as e:
+                    wres = None
+                    print(f"[FlatSepReformer] 窗口分离兜底失败: {e}")
+                if wres is not None:
+                    wf, wm = wres
+                    spks = [wf, wm] if target_speaker == "female" else [wm, wf]
+                    print(
+                        "[FlatSepReformer] target_speaker=%s 全局分离疑似失败"
+                        "（utts=%d/%d 质量=%.2f/%.2f），启用窗口分离兜底"
+                        "（4s 短窗口分离 + 谱质心性别归类）" % (
+                            target_speaker, _u1, _u2, _q1, _q2))
+                    return self._finalize(
+                        spks, audio, waveform, output_gain, match_input_sr)
+            # 兜底失败或无需兜底 → 走下方原逻辑（gate/排序/repair）
 
         # ---- 后处理（可调参数）----
         if gate_mode == "mutual":
