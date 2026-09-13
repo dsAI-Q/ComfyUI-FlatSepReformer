@@ -631,9 +631,211 @@ def _repair_holes(mix: np.ndarray, spk1: np.ndarray, spk2: np.ndarray,
     out2 = np.clip(out2, -0.999, 0.999).astype(np.float32)
     return out1, out2
 
+
 # --------------------------------------------------------------------------- #
-# 推理后端
+# 目标说话人提取（target_speaker=female/male 的通用兜底）
 # --------------------------------------------------------------------------- #
+def _active_rms(x, sr, rel_thr=0.1, min_abs=0.003):
+    """语音活跃段 RMS（帧 25ms/hop 10ms，按相对+绝对阈值）。"""
+    frame, hop = int(0.025 * sr), int(0.010 * sr)
+    n = (len(x) - frame) // hop + 1
+    if n < 1:
+        return float(np.sqrt(np.mean(x ** 2)))
+    r = np.array([np.sqrt(np.mean(x[i * hop:i * hop + frame] ** 2)) for i in range(n)])
+    thr = max(r.max() * rel_thr, min_abs)
+    act = r[r > thr]
+    return float(act.mean()) if act.size else 0.0
+
+
+def _split_utterances(x, sr, min_gap=0.30, rel_thr=0.05, min_abs=0.002):
+    """按停顿切话语段。返回 [(start_idx, end_idx)]（帧索引，帧=32ms/hop16ms）。"""
+    frame, hop = int(0.032 * sr), int(0.016 * sr)
+    n = (len(x) - frame) // hop + 1
+    if n < 4:
+        return []
+    rms = np.array([np.sqrt(np.mean(x[i * hop:i * hop + frame] ** 2)) for i in range(n)])
+    thr = max(rms.max() * rel_thr, min_abs)
+    act = rms > thr
+    # 轻微膨胀活跃区（避免切在字尾）
+    k = max(1, int(0.05 * sr) // hop)
+    act = np.convolve(act, np.ones(k, dtype=np.int32), 'same') > 0
+    utts = []
+    start = None
+    gap_frames = max(1, int(min_gap * sr) // hop)
+    last_act = -1
+    for i in range(n):
+        if act[i]:
+            if start is None:
+                start = i
+            last_act = i
+        else:
+            if start is not None and (i - last_act) > gap_frames:
+                utts.append((start, last_act + 1))
+                start = None
+    if start is not None:
+        utts.append((start, last_act + 1))
+    # 过滤超短段
+    return [u for u in utts if (u[1] - u[0]) * hop / sr >= 0.12]
+
+
+def _utt_spectral_centroid(x, frame, hop, sr, rel_thr=0.15, min_abs=0.002):
+    """话语段谱质心中位（Hz）。"""
+    seg = x
+    n = (len(seg) - frame) // hop + 1
+    if n < 3:
+        return None
+    rms = np.array([np.sqrt(np.mean(seg[i * hop:i * hop + frame] ** 2)) for i in range(n)])
+    thr = max(rms.max() * rel_thr, min_abs)
+    idx = np.where(rms > thr)[0]
+    if len(idx) < 4:
+        return None
+    cents = []
+    for i in idx:
+        w = seg[i * hop:i * hop + frame]
+        if len(w) < frame:
+            continue
+        w = w * np.hanning(frame)
+        sp = np.abs(np.fft.rfft(w))
+        freqs = np.fft.rfftfreq(frame, 1 / sr)
+        tot = np.sum(sp) + 1e-9
+        cents.append(np.sum(freqs * sp) / tot)
+    return float(np.median(cents)) if cents else None
+
+
+def _kmeans2_split(vals):
+    """2 簇分割：排序后找"最大且两边都有 >=2 个样本"的间隙，用间隙中点切分。
+
+    返回 (low_center, high_center, low_mask, high_mask) 或 None。
+    孤立点（只切出 1 个样本的间隙）会被过滤，避免单点伪峰。
+    簇中心差 < 400 视为单一音色路，返回 None。
+    """
+    vals = np.asarray(vals, dtype=np.float64)
+    n = len(vals)
+    if n < 5:
+        return None
+    sv = np.sort(vals)
+    gaps = np.diff(sv)
+    best = None
+    for i, g in enumerate(gaps):
+        cut = i + 1
+        if cut < 2 or n - cut < 2:
+            continue
+        if best is None or g > best[0]:
+            best = (g, cut)
+    if best is None:
+        return None
+    _, cut = best
+    low_c, high_c = float(np.median(sv[:cut])), float(np.median(sv[cut:]))
+    if high_c - low_c < 400:
+        return None
+    mid = (sv[cut - 1] + sv[cut]) / 2.0
+    low_mask = vals <= mid
+    high_mask = ~low_mask
+    if low_mask.sum() < 2 or high_mask.sum() < 2:
+        return None
+    return (low_c, high_c, low_mask, high_mask)
+
+
+def _utt_f0_median(x, sr, frame, hop, lo=70, hi=500, rel_thr=0.12, min_abs=0.002):
+    """话语段浊音帧基频中位（Hz），无浊音返回 None。"""
+    from scipy.signal import find_peaks as _fp
+    n = (len(x) - frame) // hop + 1
+    if n < 4:
+        return None
+    rms = np.array([np.sqrt(np.mean(x[i * hop:i * hop + frame] ** 2)) for i in range(n)])
+    thr = max(rms.max() * rel_thr, min_abs)
+    lags = np.arange(int(sr / hi), int(sr / lo))
+    f0s = []
+    for i in range(n):
+        if rms[i] <= thr:
+            continue
+        w = x[i * hop:i * hop + frame]
+        if len(w) < frame:
+            continue
+        w = w - w.mean()
+        ac = np.correlate(w, w, 'full')[len(w) - 1:]
+        ac = ac / max(ac[0], 1e-9)
+        s2 = ac[lags]
+        if len(s2) < 10:
+            continue
+        pk, props = _fp(s2, height=0.3)
+        if len(pk) == 0:
+            continue
+        f0 = sr / lags[pk[np.argmax(props['peak_heights'])]]
+        if lo <= f0 <= hi:
+            f0s.append(f0)
+    return float(np.median(f0s)) if len(f0s) >= 4 else None
+
+
+def _detect_mixed_route(w0, w1, sr):
+    """检测两路中是否存在'混合语音路'（一路里男女话语都有、另一路是音乐/残渣）。
+
+    返回 (voice_index, low_utts, high_utts, (low_center, high_center)) 或 None。
+    判定：话语段谱质心 2-means 双簇（簇差>400 且每簇>=2 段）且高簇质心>1150
+    （明显女声音色）且低簇基频中位<200（明显男声）。两路都是正常语音时
+    （各自单簇，或高簇不够女声）返回 None，回退正常分离逻辑。
+    """
+    frame, hop = int(0.032 * sr), int(0.016 * sr)
+    for vi, x in enumerate((w0, w1)):
+        utts = _split_utterances(x, sr)
+        if len(utts) < 5:
+            continue
+        feats = []
+        for a, b in utts:
+            seg = x[a * hop:min(b * hop, len(x))]
+            c = _utt_spectral_centroid(seg, frame, hop, sr)
+            if c is not None:
+                feats.append(c)
+        if len(feats) < 4:
+            continue
+        r = _kmeans2_split(feats)
+        if r is None:
+            continue
+        low_c, high_c, low_mask, high_mask = r
+        if high_c - low_c < 400 or high_c < 1150:
+            continue
+        # ---- 边界修正：质心落在两簇中点 ±15% 的话语段用基频裁决 ----
+        # 女声低音/快语速段的谱质心可能贴近男声簇，男声高音段反之；
+        # 谱质心模糊时基频（F0>200 女声 / <160 男声）更可靠。
+        mid = (low_c + high_c) / 2.0
+        for i, c in enumerate(feats):
+            if mid * 0.85 <= c <= mid * 1.15:
+                a, b = utts[i]
+                seg = x[a * hop:min(b * hop, len(x))]
+                f = _utt_f0_median(seg, sr, frame, hop)
+                if f is None:
+                    continue
+                if f > 200:
+                    low_mask[i], high_mask[i] = False, True
+                elif f < 160:
+                    low_mask[i], high_mask[i] = True, False
+        low_utts = [utts[i] for i in np.where(low_mask)[0]]
+        high_utts = [utts[i] for i in np.where(high_mask)[0]]
+        if len(low_utts) < 1 or len(high_utts) < 1:
+            continue
+        # 低簇（男声）基频中位必须明显低于女声阈值
+        low_f0s = []
+        for a, b in low_utts:
+            seg = x[a * hop:min(b * hop, len(x))]
+            f = _utt_f0_median(seg, sr, frame, hop)
+            if f is not None:
+                low_f0s.append(f)
+        if not low_f0s or np.median(low_f0s) >= 200:
+            continue
+        return (vi, low_utts, high_utts, (low_c, high_c))
+    return None
+
+
+def _concat_utterances(x, mask, sr):
+    """按话语段掩码把 x 对应时间段拼到时间轴上（保留静音间隔）。"""
+    out = np.zeros_like(x)
+    frame, hop = int(0.032 * sr), int(0.016 * sr)
+    for a, b in mask:
+        out[a * hop:min(b * hop, len(x))] = x[a * hop:min(b * hop, len(x))]
+    return out
+
+
+
 def _resolve_device(device: str) -> str:
     if device != "auto":
         return device
@@ -889,6 +1091,16 @@ class FlatSepReformerSeparate:
                      "tooltip": "空洞修复的重分离窗口上下文余量（秒）：重分离时在句子前后各"
                                 "多取的音频，给模型更多上下文，分离更稳。默认 0.3"},
                 ),
+                "target_speaker": (
+                    ["auto", "female", "male"],
+                    {"default": "auto",
+                     "tooltip": "目标说话人（通用兜底）：auto=正常双路分离。当输入含背景音乐"
+                                "或两人音色接近导致模型无法分开时，选 female/male 启用"
+                                "‘目标说话人提取’：自动检测混合语音路，按话语段的谱质心"
+                                "聚类（男低女高），把目标性别的完整话语段输出到 speaker_1，"
+                                "另一人输出到 speaker_2。检测不到混合语音路时自动回退"
+                                "正常分离逻辑，不影响原结果"},
+                ),
             }
         }
 
@@ -903,7 +1115,7 @@ class FlatSepReformerSeparate:
                  output_order: str = "auto", mutual_threshold: float = 0.25,
                  gender_f0_threshold: float = DEFAULT_GENDER_F0_THRESHOLD,
                  repair_mode: str = "off", repair_min_hole: float = 0.15,
-                 repair_pad: float = 0.3):
+                 repair_pad: float = 0.3, target_speaker: str = "auto"):
         model_dir = find_model_dir()
         if not model_dir:
             # 运行时自动下载到默认目标文件夹: <ComfyUI>/models/FlatSepReformer
@@ -927,6 +1139,41 @@ class FlatSepReformerSeparate:
         spks = (_infer_onnx(model["session"], waveform)
                 if model["backend"] == "onnx"
                 else _infer_modelscope(model["pipeline"], waveform))
+
+        # ---- 目标说话人提取（target_speaker=female/male）----
+        # 模型在"输入含背景音乐/哼唱"或"两人音色接近"时可能把两个真人语音挤到
+        # 同一路、另一路变成音乐/残渣。此时切换到"语音路 utterance 级谱质心聚类"：
+        # 对语音路按停顿切成话语段，每段谱质心中位聚类（男低女高），把目标性别的
+        # 话语段完整提取出来。若两路都是正常语音（未检测到混合语音路），回退到
+        # 下方原有 gate/排序/repair 逻辑，旧工作流行为完全不变。
+        if target_speaker in ("female", "male"):
+            route = _detect_mixed_route(spks[0], spks[1], TARGET_SAMPLE_RATE)
+            if route is not None:
+                vi, low_mask, high_mask, feats = route
+                voice = spks[vi]
+                is_female = target_speaker == "female"
+                sel = high_mask if is_female else low_mask
+                other = low_mask if is_female else high_mask
+                spk1 = _concat_utterances(voice, sel, TARGET_SAMPLE_RATE)
+                spk2 = _concat_utterances(voice, other, TARGET_SAMPLE_RATE)
+                # 增益对齐 spk1 活跃段 RMS，限幅防削波
+                ref = _active_rms(spk1, TARGET_SAMPLE_RATE)
+                if ref > 1e-4:
+                    for k, s in enumerate((spk1, spk2)):
+                        if _active_rms(s, TARGET_SAMPLE_RATE) > 1e-4:
+                            g = np.clip(ref / _active_rms(s, TARGET_SAMPLE_RATE), 0.5, 2.0)
+                            spks[k] = np.clip(s * g, -1.0, 1.0)
+                        else:
+                            spks[k] = s
+                else:
+                    spks = [spk1, spk2]
+                print(
+                    f"[FlatSepReformer] target_speaker={target_speaker} 检测到混合语音路"
+                    f"（模型未把两人分开），按话语段谱质心聚类提取："
+                    f"质心低簇={feats[0]:.0f}Hz 高簇={feats[1]:.0f}Hz")
+                # 提取模式下 spk1 已完整，跳过 gate/排序/repair
+                return self._finalize(
+                    spks, audio, waveform, output_gain, match_input_sr)
 
         # ---- 后处理（可调参数）----
         if gate_mode == "mutual":
@@ -968,6 +1215,11 @@ class FlatSepReformerSeparate:
             print(f"[FlatSepReformer] repair_mode=auto 空洞修复完成")
 
         # ---- 增益 + 输出采样率 ----
+        return self._finalize(spks, audio, waveform, output_gain, match_input_sr)
+
+    def _finalize(self, spks, audio, waveform, output_gain, match_input_sr):
+        """增益 + 输出采样率（供正常流程与目标说话人提取共用）。"""
+        input_sr = audio["sample_rate"]
         outs = []
         for spk in spks:
             if output_gain != 1.0:

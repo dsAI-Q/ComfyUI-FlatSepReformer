@@ -27,6 +27,12 @@
   常整体掩蔽丢弃，导致 speaker_1 丢字、内容跑进 speaker_2。开启后自动检测空洞、
   局部窗口重分离找回弱音节补回 speaker_1，并清理 speaker_2 重复；**音区校验 +
   句内延续校验**确保对方说话人的内容（男声）不会被误补进 spk1
+- 🎯 **目标说话人提取（target_speaker=female/male，通用兜底）**：输入含背景音乐/
+  哼唱、或两人音色接近导致模型把两个真人语音挤进同一路（另一路变成音乐/残渣）
+  时，选 `female`/`male` 启用兜底管线：自动检测"混合语音路"→ 话语段谱质心聚类
+  （男低女高，边界段用基频裁决）→ 把目标性别的**完整**话语段输出到 speaker_1，
+  另一人输出到 speaker_2。检测不到混合语音路时自动回退正常分离逻辑，**不影响
+  旧工作流任何行为**
 - 🚀 **双推理后端（auto 自动选择）**：
   - `onnx`：使用 `onnx_model.onnx`，基于 ONNX Runtime，**无需安装 modelscope**（默认优先）
   - `modelscope`：使用 `pytorch_model.pt`（需 master 源码版）
@@ -108,9 +114,18 @@ modelscope download --model iic/speech_flatsepreformer_separation_temporal_8k_ba
 
 | 节点 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| **FlatSepReformer (Separate 2 Speakers)** | `audio`、`backend`、`device`、`output_order`、`gate_mode`、`gate_threshold`、`mutual_threshold`、`gender_f0_threshold`、`output_gain`、`match_input_sr`、`repair_mode`、`repair_min_hole`、`repair_pad` | `speaker_1`、`speaker_2` | **合并节点**：自动加载 `<ComfyUI>/models/FlatSepReformer` 模型并分离双说话人。`backend` 默认 `auto`（优先 onnx，无需 modelscope）。`output_order` 默认 `auto`（固定 speaker_1 = 较正常的人声，质量接近时女声优先）。`repair_mode=auto` 开启空洞修复（找回被模型吞掉的弱音节，见下文） |
+| **FlatSepReformer (Separate 2 Speakers)** | `audio`、`backend`、`device`、`output_order`、`gate_mode`、`gate_threshold`、`mutual_threshold`、`gender_f0_threshold`、`output_gain`、`match_input_sr`、`repair_mode`、`repair_min_hole`、`repair_pad`、`target_speaker` | `speaker_1`、`speaker_2` | **合并节点**：自动加载 `<ComfyUI>/models/FlatSepReformer` 模型并分离双说话人。`backend` 默认 `auto`（优先 onnx，无需 modelscope）。`output_order` 默认 `auto`（固定 speaker_1 = 较正常的人声，质量接近时女声优先）。`repair_mode=auto` 开启空洞修复（找回被模型吞掉的弱音节）。`target_speaker=female/male` 启用目标说话人提取兜底（见 v2.3） |
 | **Load Audio (FlatSepReformer)** | `audio_path` | `audio` | 加载 wav/flac/ogg/mp3 等格式音频文件 |
 | **Save Audio (FlatSepReformer)** | `audio`、`filename`、`output_dir` | `filepath` | 保存为 wav，返回保存路径（默认 `<ComfyUI>/output/`） |
+
+> v2.3 变更：新增 `target_speaker=female/male` **目标说话人提取兜底**。当输入含
+> 背景音乐/哼唱，或两人音色接近（如影视对白里 F0 高度重叠的男女声）时，模型
+> 可能把两个真人语音挤进同一路、另一路变成音乐/残渣（常见现象：speaker_1 是
+> 背景音、全部台词在 speaker_2）。此时选 `target_speaker=female`（或 `male`）：
+> 节点自动检测"混合语音路"，对该路做 **VAD 切分 → 话语段谱质心聚类（男低女高，
+> 边界段用基频裁决）→ 目标性别话语段拼接**，保证 speaker_1 输出**纯净且完整**
+> 的目标性别语音、speaker_2 输出另一人。未检测到混合语音路时自动回退正常分离
+> 逻辑，旧工作流行为完全不变（默认 `auto`）。
 
 > v2.2 变更：新增 `repair_mode=auto` 空洞修复。模型对影视对白的弱音节（如
 > "咦""唇""破"等）常直接掩蔽丢弃，导致 speaker_1 丢字/缺内容。开启后节点自动：
@@ -198,6 +213,13 @@ $env:FLATSEPREFORMER_MODEL_DIR = "D:/models/FlatSepReformer"
 2. `gate_mode=mutual`：交替对话推荐开启，逐帧压低另一路的泄漏，两路都更干净
 3. 想固定"男声=spk2、女声=spk1"，保持 `output_order=auto` 即可（女声次级规则）；
    性别判定不准时可调 `gender_f0_threshold`（默认 165Hz）
+
+**Q: 换了音频后男女声完全分不开，speaker_1 是音乐/背景音，台词全在 speaker_2？**
+输入含背景音乐/哼唱、或两人音色接近（影视对白里常见）时，模型的 Libri2Mix 训练
+分布失效，可能把两个真人语音挤到同一路。解法：**把节点 `target_speaker` 设为
+`female` 或 `male`**，节点自动检测"混合语音路"并按话语段谱质心聚类（男低女高，
+边界段用基频裁决）把目标性别的完整语音提取到 speaker_1、另一人输出到 speaker_2。
+检测不到混合语音路时自动回退正常分离逻辑，不影响原结果。
 
 **Q: 报错 `... is not in the pipelines registry group speech-separation`**
 modelscope 是 PyPI 版，其 pipeline 注册表还没有这个新模型。两种解法：
